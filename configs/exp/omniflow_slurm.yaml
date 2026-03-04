@@ -1,0 +1,10 @@
+name: omniflow-slurm
+workdir: /Users/zirui/code/OmniFlow-amd
+metrics_interval_sec: 5
+warmup_steps: 50
+env:
+  DOCKER_IMAGE: docker.io/rocm/primus:v25.9_gfx942
+  CONFIG: examples/debug_fsdp2_new2_5b_sp.yml
+command:
+  - sbatch
+  - examples/run_slurm.sh

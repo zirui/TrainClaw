@@ -1,0 +1,15 @@
+name: phase1-smoke
+workdir: .
+metrics_interval_sec: 2
+warmup_steps: 0
+env:
+  PYTHONUNBUFFERED: "1"
+command:
+  - python3
+  - -u
+  - -c
+  - |
+      import time
+      for i in range(1, 11):
+          print(f"step={i} loss={1.0/i:.6f} throughput={100+i:.2f} s/iter={0.1+0.001*i:.4f}", flush=True)
+          time.sleep(0.2)
