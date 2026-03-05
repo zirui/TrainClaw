@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import statistics
 import subprocess
 import sys
@@ -19,6 +20,19 @@ THROUGHPUT_RE = re.compile(
     r"(?:throughput|samples/s|tokens/s)\s*[=: ]\s*([-+0-9.eE]+)", re.IGNORECASE
 )
 SITER_RE = re.compile(r"(?:s/iter|sec/iter|step\s*time)\s*[=: ]\s*([-+0-9.eE]+)", re.IGNORECASE)
+SBATCH_JOB_RE = re.compile(r"Submitted\s+batch\s+job\s+(\d+)", re.IGNORECASE)
+SBATCH_OUT_RE = re.compile(r"^\s*#SBATCH\s+(?:--output(?:=|\s+)|-o\s+)(\S+)")
+SLURM_TERMINAL_STATES = {
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+    "TIMEOUT",
+    "PREEMPTED",
+    "OUT_OF_MEMORY",
+    "BOOT_FAIL",
+    "DEADLINE",
+    "NODE_FAIL",
+}
 
 
 def load_config(path):
@@ -51,7 +65,17 @@ def now_ts():
     return datetime.utcnow().isoformat() + "Z"
 
 
-def query_gpu_snapshot():
+def detect_gpu_backend(config_backend):
+    if config_backend and config_backend != "auto":
+        return config_backend
+    if shutil.which("nvidia-smi"):
+        return "nvidia"
+    if shutil.which("amd-smi") or shutil.which("rocm-smi"):
+        return "amd"
+    return "none"
+
+
+def query_nvidia_snapshot():
     cmd = [
         "nvidia-smi",
         "--query-gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu",
@@ -74,9 +98,90 @@ def query_gpu_snapshot():
                 "memory_used_mb": try_float(parts[2]),
                 "memory_total_mb": try_float(parts[3]),
                 "temperature_c": try_float(parts[4]),
+                "gpu_backend": "nvidia",
             }
         )
     return records
+
+
+def query_amd_snapshot():
+    # Prefer rocm-smi JSON when available because format is more stable for parsing.
+    if shutil.which("rocm-smi"):
+        try:
+            out = subprocess.check_output(
+                ["rocm-smi", "--showuse", "--showmemuse", "--json"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            data = json.loads(out)
+            records = []
+            for card_name, payload in data.items():
+                idx = None
+                m = re.search(r"(\d+)", str(card_name))
+                if m:
+                    idx = int(m.group(1))
+                gpu_use = None
+                mem_use_pct = None
+                if isinstance(payload, dict):
+                    for k, v in payload.items():
+                        key = str(k).lower()
+                        if "gpu use" in key:
+                            gpu_use = try_float(str(v).replace("%", "").strip())
+                        if "memory use" in key:
+                            mem_use_pct = try_float(str(v).replace("%", "").strip())
+                records.append(
+                    {
+                        "gpu_index": idx if idx is not None else -1,
+                        "utilization_gpu_pct": gpu_use,
+                        "memory_used_mb": None,
+                        "memory_total_mb": None,
+                        "memory_used_pct": mem_use_pct,
+                        "temperature_c": None,
+                        "gpu_backend": "amd",
+                    }
+                )
+            return records
+        except Exception:
+            pass
+
+    if shutil.which("amd-smi"):
+        # Fallback: keep raw monitor snapshot for troubleshooting when parser is unavailable.
+        try:
+            out = subprocess.check_output(
+                ["amd-smi", "list"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            records = []
+            for line in out.splitlines():
+                if not line.strip():
+                    continue
+                m = re.search(r"(\d+)", line)
+                idx = int(m.group(1)) if m else -1
+                records.append(
+                    {
+                        "gpu_index": idx,
+                        "utilization_gpu_pct": None,
+                        "memory_used_mb": None,
+                        "memory_total_mb": None,
+                        "temperature_c": None,
+                        "gpu_backend": "amd",
+                        "raw": line.strip(),
+                    }
+                )
+            return records
+        except Exception:
+            pass
+
+    return []
+
+
+def query_gpu_snapshot(gpu_backend):
+    if gpu_backend == "nvidia":
+        return query_nvidia_snapshot()
+    if gpu_backend == "amd":
+        return query_amd_snapshot()
+    return []
 
 
 def parse_train_line(line):
@@ -98,10 +203,10 @@ def parse_train_line(line):
     return item if item else None
 
 
-def gpu_sampler(stop_event, interval_sec, metrics_fh):
+def gpu_sampler(stop_event, interval_sec, metrics_fh, gpu_backend):
     while not stop_event.is_set():
         ts = now_ts()
-        for rec in query_gpu_snapshot():
+        for rec in query_gpu_snapshot(gpu_backend):
             metrics_fh.write(json.dumps({"ts": ts, "type": "gpu", **rec}, ensure_ascii=True) + "\n")
         metrics_fh.flush()
         stop_event.wait(interval_sec)
@@ -125,8 +230,13 @@ def summarize(train_records, gpu_records, warmup_steps):
 
     peak_mem = {}
     for g in gpu_records:
-        idx = g["gpu_index"]
-        peak_mem[idx] = max(peak_mem.get(idx, 0.0), g.get("memory_used_mb") or 0.0)
+        idx = g.get("gpu_index")
+        if idx is None:
+            continue
+        mem_used = g.get("memory_used_mb")
+        if mem_used is None:
+            continue
+        peak_mem[idx] = max(peak_mem.get(idx, 0.0), mem_used)
 
     return {
         "train_points": len(train_records),
@@ -137,6 +247,119 @@ def summarize(train_records, gpu_records, warmup_steps):
         "peak_gpu_mem_mb": {str(k): v for k, v in sorted(peak_mem.items())},
         "warmup_steps": warmup_steps,
     }
+
+
+def maybe_parse_sbatch_log_template(sbatch_script_path):
+    if not sbatch_script_path:
+        return None
+    p = Path(sbatch_script_path)
+    if not p.exists():
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                m = SBATCH_OUT_RE.search(line)
+                if m:
+                    return m.group(1).strip()
+    except Exception:
+        return None
+    return None
+
+
+def resolve_slurm_log_path(workdir, template_path, job_id):
+    if not template_path:
+        return None
+    rendered = template_path.replace("%j", str(job_id))
+    p = Path(rendered)
+    if not p.is_absolute():
+        p = Path(workdir) / p
+    return p.resolve()
+
+
+def slurm_job_state(job_id):
+    try:
+        out = subprocess.check_output(
+            ["squeue", "-h", "-j", str(job_id), "-o", "%T"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        if out:
+            return out.splitlines()[0].strip(), True
+    except Exception:
+        pass
+
+    try:
+        out = subprocess.check_output(
+            ["sacct", "-j", str(job_id), "--format=State", "--noheader"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        states = [x.strip() for x in out.splitlines() if x.strip()]
+        if states:
+            # Keep the first non-empty state as a coarse job state.
+            state = states[0].split()[0].upper()
+            return states[0], state not in SLURM_TERMINAL_STATES
+    except Exception:
+        pass
+
+    return "UNKNOWN", False
+
+
+def stream_external_log(
+    log_path,
+    job_id,
+    log_fh,
+    metrics_fh,
+    train_records,
+    gpu_records,
+    gpu_backend,
+    interval_sec,
+    wait_timeout,
+):
+    start_wait = time.time()
+    while not log_path.exists() and (time.time() - start_wait) < wait_timeout:
+        time.sleep(1)
+
+    if not log_path.exists():
+        return
+
+    offset = 0
+    idle_rounds = 0
+
+    while True:
+        if log_path.exists():
+            with open(log_path, "r", encoding="utf-8", errors="replace") as rf:
+                rf.seek(offset)
+                chunk = rf.read()
+                if chunk:
+                    idle_rounds = 0
+                    for line in chunk.splitlines(keepends=True):
+                        sys.stdout.write(line)
+                        log_fh.write(line)
+                        parsed = parse_train_line(line)
+                        if parsed:
+                            train_records.append(parsed)
+                            metrics_fh.write(
+                                json.dumps({"ts": now_ts(), "type": "train", **parsed}, ensure_ascii=True)
+                                + "\n"
+                            )
+                    metrics_fh.flush()
+                    log_fh.flush()
+                    offset = rf.tell()
+                else:
+                    idle_rounds += 1
+
+        ts = now_ts()
+        for rec in query_gpu_snapshot(gpu_backend):
+            metrics_fh.write(json.dumps({"ts": ts, "type": "gpu", **rec}, ensure_ascii=True) + "\n")
+            gpu_records.append(rec)
+        metrics_fh.flush()
+
+        time.sleep(interval_sec)
+
+        _, active = slurm_job_state(job_id)
+        if not active and idle_rounds >= 2:
+            break
 
 
 def main():
@@ -160,16 +383,24 @@ def main():
     summary_path = out_dir / "summary.json"
     log_path = logs_dir / "train.log"
 
-    if not args.skip_env_check:
-        env_out = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("env_check.py"))],
-            capture_output=True,
-            text=True,
-        )
-        env_report_path.write_text(env_out.stdout or env_out.stderr, encoding="utf-8")
-
     env = os.environ.copy()
     env.update(config.get("env") or {})
+
+    env_check_cfg = config.get("env_check") or {}
+    env_check_enabled = not args.skip_env_check and env_check_cfg.get("enabled", True)
+    gpu_cfg = config.get("gpu") or {}
+    gpu_backend = detect_gpu_backend(gpu_cfg.get("backend", "auto"))
+
+    if env_check_enabled:
+        env_cmd = [sys.executable, str(Path(__file__).with_name("env_check.py"),)]
+        env_cmd += ["--gpu-backend", gpu_backend]
+        if env_check_cfg.get("torch_python_cmd"):
+            env_cmd += ["--torch-python-cmd", str(env_check_cfg["torch_python_cmd"])]
+        if env_check_cfg.get("torch_check_command"):
+            env_cmd += ["--torch-check-command", str(env_check_cfg["torch_check_command"])]
+
+        env_out = subprocess.run(env_cmd, capture_output=True, text=True, env=env)
+        env_report_path.write_text(env_out.stdout or env_out.stderr, encoding="utf-8")
 
     cmd = config.get("command")
     if not cmd:
@@ -185,17 +416,28 @@ def main():
     workdir = config.get("workdir", ".")
     warmup_steps = int(config.get("warmup_steps", 0))
     interval_sec = float(config.get("metrics_interval_sec", 2.0))
+    slurm_cfg = config.get("slurm") or {}
 
     start = time.time()
     train_records = []
     gpu_records = []
+    slurm_job_id = None
+    slurm_log_path = None
+    slurm_state = None
 
     with open(log_path, "w", encoding="utf-8") as log_fh, open(
         metrics_path, "w", encoding="utf-8"
     ) as metrics_fh:
         stop_event = threading.Event()
-        t = threading.Thread(target=gpu_sampler, args=(stop_event, interval_sec, metrics_fh), daemon=True)
-        t.start()
+        sampler_enabled = slurm_cfg.get("follow", False) is False
+        t = None
+        if sampler_enabled:
+            t = threading.Thread(
+                target=gpu_sampler,
+                args=(stop_event, interval_sec, metrics_fh, gpu_backend),
+                daemon=True,
+            )
+            t.start()
 
         proc = subprocess.Popen(
             cmd_list,
@@ -209,36 +451,84 @@ def main():
         )
 
         assert proc.stdout is not None
+        submit_stdout_lines = []
         for line in proc.stdout:
+            submit_stdout_lines.append(line.rstrip("\n"))
             sys.stdout.write(line)
             log_fh.write(line)
+
             parsed = parse_train_line(line)
             if parsed:
                 item = {"ts": now_ts(), "type": "train", **parsed}
                 metrics_fh.write(json.dumps(item, ensure_ascii=True) + "\n")
                 train_records.append(parsed)
+
             metrics_fh.flush()
             log_fh.flush()
 
-            # Collect a snapshot opportunistically to reduce missing data for short jobs.
-            ts = now_ts()
-            for rec in query_gpu_snapshot():
-                metrics_fh.write(json.dumps({"ts": ts, "type": "gpu", **rec}, ensure_ascii=True) + "\n")
-                gpu_records.append(rec)
+            if sampler_enabled:
+                ts = now_ts()
+                for rec in query_gpu_snapshot(gpu_backend):
+                    metrics_fh.write(json.dumps({"ts": ts, "type": "gpu", **rec}, ensure_ascii=True) + "\n")
+                    gpu_records.append(rec)
 
         exit_code = proc.wait()
-        stop_event.set()
-        t.join(timeout=2)
 
-        # Final sample
+        if t is not None:
+            stop_event.set()
+            t.join(timeout=2)
+
+        submit_stdout = "\n".join(submit_stdout_lines)
+        m = SBATCH_JOB_RE.search(submit_stdout)
+        if exit_code == 0 and m:
+            slurm_job_id = m.group(1)
+
+            sbatch_script = cmd_list[-1] if cmd_list else None
+            if sbatch_script and not Path(sbatch_script).is_absolute():
+                sbatch_script = str((Path(workdir) / sbatch_script).resolve())
+
+            out_template = slurm_cfg.get("out_path_template") or maybe_parse_sbatch_log_template(sbatch_script)
+            if out_template:
+                slurm_log_path = str(resolve_slurm_log_path(workdir, out_template, slurm_job_id))
+
+            if slurm_log_path:
+                link_path = logs_dir / "slurm_job.log"
+                try:
+                    if link_path.exists() or link_path.is_symlink():
+                        link_path.unlink()
+                    os.symlink(slurm_log_path, link_path)
+                except Exception:
+                    pass
+
+            if slurm_cfg.get("follow", False) and slurm_log_path:
+                stream_external_log(
+                    Path(slurm_log_path),
+                    slurm_job_id,
+                    log_fh,
+                    metrics_fh,
+                    train_records,
+                    gpu_records,
+                    gpu_backend,
+                    float(slurm_cfg.get("poll_interval_sec", interval_sec)),
+                    float(slurm_cfg.get("wait_for_log_timeout_sec", 900)),
+                )
+                slurm_state, _ = slurm_job_state(slurm_job_id)
+
         ts = now_ts()
-        for rec in query_gpu_snapshot():
+        for rec in query_gpu_snapshot(gpu_backend):
             metrics_fh.write(json.dumps({"ts": ts, "type": "gpu", **rec}, ensure_ascii=True) + "\n")
             gpu_records.append(rec)
         metrics_fh.flush()
 
     duration = time.time() - start
     summary = summarize(train_records, gpu_records, warmup_steps)
+    status = "success" if exit_code == 0 else "failed"
+    if slurm_cfg.get("follow", False) and slurm_state and slurm_state.upper() not in {
+        "COMPLETED",
+        "COMPLETING",
+    }:
+        status = "failed"
+
     summary.update(
         {
             "exp_id": exp_id,
@@ -248,7 +538,11 @@ def main():
             "command": cmd_list,
             "duration_sec": duration,
             "exit_code": exit_code,
-            "status": "success" if exit_code == 0 else "failed",
+            "status": status,
+            "gpu_backend": gpu_backend,
+            "slurm_job_id": slurm_job_id,
+            "slurm_log_path": slurm_log_path,
+            "slurm_state": slurm_state,
             "artifacts": {
                 "log": str(log_path.resolve()),
                 "metrics": str(metrics_path.resolve()),
@@ -260,7 +554,7 @@ def main():
     summary_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=True, indent=2))
 
-    sys.exit(exit_code)
+    sys.exit(0 if status == "success" else 1)
 
 
 if __name__ == "__main__":

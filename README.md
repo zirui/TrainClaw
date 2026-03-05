@@ -21,7 +21,11 @@ OmniFlow (text-to-video) Slurm submit example:
 ./scripts/run_local.sh configs/exp/omniflow_slurm.yaml
 ```
 
-Notes: this submits via `sbatch` to `/Users/zirui/code/OmniFlow-amd/examples/run_slurm.sh`; training logs will land in that repo under `logs/omniflow.<jobid>.out`. Phase 1 launcher records submission metadata but does not stream Slurm logs.
+Notes:
+- This submits via `sbatch` to `/Users/zirui/code/OmniFlow-amd/examples/run_slurm.sh`.
+- Launcher parses `jobid`, resolves Slurm log path (`logs/omniflow.<jobid>.out`), and creates `results/<exp_id>/logs/slurm_job.log` symlink.
+- Set `slurm.follow: true` in config to tail job log into `results/<exp_id>/logs/train.log` and parse metrics from it.
+- For Slurm jobs that run in container/other venv, set `env_check.enabled: false` or configure `env_check.torch_python_cmd` / `env_check.torch_check_command`.
 
 The launcher writes artifacts under `results/<exp_id>/`:
 
@@ -34,4 +38,4 @@ The launcher writes artifacts under `results/<exp_id>/`:
 
 - Config supports JSON or YAML (`YAML` requires `PyYAML`).
 - Training log parser is regex-based and framework-agnostic.
-- GPU stats are sampled via `nvidia-smi` when available.
+- GPU stats backend supports auto-detect for `nvidia-smi`, `rocm-smi`, and basic `amd-smi` fallback.
