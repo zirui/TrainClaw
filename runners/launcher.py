@@ -279,6 +279,39 @@ def parse_key_values(line):
     return parsed
 
 
+def is_useful_train_metric(item):
+    if not item:
+        return False
+
+    primary_keys = {
+        "loss",
+        "s_per_iter",
+        "throughput",
+        "lr",
+        "learning_rate",
+        "grad_norm",
+        "mem_used_mb",
+        "mem_total_mb",
+        "mem_ratio_pct",
+        "elapsed_sec",
+        "eta_sec",
+    }
+    if any(k in item for k in primary_keys):
+        return True
+
+    # Keep explicit step updates only if they include at least one additional numeric signal.
+    if "step" in item:
+        numeric_count = 0
+        for k, v in item.items():
+            if k == "step":
+                continue
+            if isinstance(v, (int, float)):
+                numeric_count += 1
+        return numeric_count >= 1
+
+    return False
+
+
 def parse_train_line(line):
     item = parse_key_values(line)
 
@@ -300,7 +333,9 @@ def parse_train_line(line):
         if m:
             item["s_per_iter"] = try_float(m.group(1))
 
-    return item if item else None
+    if not is_useful_train_metric(item):
+        return None
+    return item
 
 
 def gpu_sampler(stop_event, interval_sec, metrics_fh, gpu_backend):
