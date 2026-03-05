@@ -16,10 +16,10 @@ from pathlib import Path
 
 STEP_RE = re.compile(r"(?:step|iter)\s*[=: ]\s*(\d+)", re.IGNORECASE)
 LOSS_RE = re.compile(r"\bloss\s*[=: ]\s*([-+0-9.eE]+)", re.IGNORECASE)
-THROUGHPUT_RE = re.compile(
-    r"(?:throughput|samples/s|tokens/s)\s*[=: ]\s*([-+0-9.eE]+)", re.IGNORECASE
-)
+THROUGHPUT_RE = re.compile(r"(?:throughput|samples/s|tokens/s)\s*[=: ]\s*([-+0-9.eE]+)", re.IGNORECASE)
 SITER_RE = re.compile(r"(?:s/iter|sec/iter|step\s*time)\s*[=: ]\s*([-+0-9.eE]+)", re.IGNORECASE)
+KEYVAL_RE = re.compile(r"([A-Za-z][A-Za-z0-9_./-]*)=([^\s,]+)")
+MEM_PAIR_RE = re.compile(r"^\s*([-+0-9.]+)\s*/\s*([-+0-9.]+)\s*([A-Za-z]+)?\s*$")
 SBATCH_JOB_RE = re.compile(r"Submitted\s+batch\s+job\s+(\d+)", re.IGNORECASE)
 SBATCH_OUT_RE = re.compile(r"^\s*#SBATCH\s+(?:--output(?:=|\s+)|-o\s+)(\S+)")
 SLURM_TERMINAL_STATES = {
@@ -184,21 +184,121 @@ def query_gpu_snapshot(gpu_backend):
     return []
 
 
-def parse_train_line(line):
-    step = STEP_RE.search(line)
-    loss = LOSS_RE.search(line)
-    tput = THROUGHPUT_RE.search(line)
-    siter = SITER_RE.search(line)
+def normalize_key(raw_key):
+    key = raw_key.strip().lower()
+    key = key.replace("/", "_per_").replace(".", "_").replace("-", "_")
+    aliases = {
+        "iter": "step",
+        "iteration": "step",
+        "steps": "step",
+        "step_time": "s_per_iter",
+        "iter_time": "s_per_iter",
+        "sec_per_iter": "s_per_iter",
+        "seconds_per_iter": "s_per_iter",
+        "samples_per_s": "throughput",
+        "tokens_per_s": "throughput",
+        "gnorm": "grad_norm",
+    }
+    return aliases.get(key, key)
 
-    item = {}
-    if step:
-        item["step"] = int(step.group(1))
-    if loss:
-        item["loss"] = try_float(loss.group(1))
-    if tput:
-        item["throughput"] = try_float(tput.group(1))
-    if siter:
-        item["s_per_iter"] = try_float(siter.group(1))
+
+def parse_number_with_unit(raw_value):
+    text = raw_value.strip().lower()
+    if not text:
+        return None
+
+    mem_pair = MEM_PAIR_RE.match(text)
+    if mem_pair:
+        used = try_float(mem_pair.group(1))
+        total = try_float(mem_pair.group(2))
+        unit = (mem_pair.group(3) or "gb").lower()
+        factor = 1024.0 if unit in {"gb", "gib"} else 1.0
+        if unit in {"mb", "mib", "gb", "gib"} and used is not None and total is not None:
+            return {
+                "kind": "mem_pair",
+                "used_mb": used * factor,
+                "total_mb": total * factor,
+                "ratio_pct": (used / total * 100.0) if total else None,
+            }
+
+    suffix_scale = {
+        "ms": ("seconds", 1e-3),
+        "s": ("seconds", 1.0),
+        "m": ("seconds", 60.0),
+        "h": ("seconds", 3600.0),
+        "kb": ("mb", 1.0 / 1024.0),
+        "kib": ("mb", 1.0 / 1024.0),
+        "mb": ("mb", 1.0),
+        "mib": ("mb", 1.0),
+        "gb": ("mb", 1024.0),
+        "gib": ("mb", 1024.0),
+        "%": ("pct", 1.0),
+    }
+
+    m = re.match(r"^([-+0-9.eE]+)([A-Za-z%]+)?$", text)
+    if not m:
+        return None
+    number = try_float(m.group(1))
+    if number is None:
+        return None
+    suffix = (m.group(2) or "").lower()
+    if suffix in suffix_scale:
+        _, scale = suffix_scale[suffix]
+        return {"kind": suffix, "value": number * scale}
+    return {"kind": "number", "value": number}
+
+
+def parse_key_values(line):
+    parsed = {}
+    for key, value in KEYVAL_RE.findall(line):
+        nkey = normalize_key(key)
+        converted = parse_number_with_unit(value)
+        if converted is None:
+            parsed[nkey] = value
+            continue
+
+        if converted.get("kind") == "mem_pair":
+            parsed[f"{nkey}_used_mb"] = converted.get("used_mb")
+            parsed[f"{nkey}_total_mb"] = converted.get("total_mb")
+            parsed[f"{nkey}_ratio_pct"] = converted.get("ratio_pct")
+            continue
+
+        val = converted.get("value")
+        if nkey in {"step"} and val is not None:
+            parsed[nkey] = int(val)
+        elif nkey in {"elapsed", "eta"} and val is not None and converted.get("kind") in {"ms", "s", "m", "h"}:
+            parsed[f"{nkey}_sec"] = val
+        elif nkey in {"s_per_iter"} and val is not None and converted.get("kind") in {"ms", "s", "m", "h"}:
+            parsed[nkey] = val
+        elif converted.get("kind") in {"kb", "kib", "mb", "mib", "gb", "gib"}:
+            parsed[f"{nkey}_mb"] = val
+        elif converted.get("kind") == "%":
+            parsed[f"{nkey}_pct"] = val
+        else:
+            parsed[nkey] = val
+    return parsed
+
+
+def parse_train_line(line):
+    item = parse_key_values(line)
+
+    # Lightweight fallback for logs that do not use key=value style.
+    if "step" not in item:
+        m = STEP_RE.search(line)
+        if m:
+            item["step"] = int(m.group(1))
+    if "loss" not in item:
+        m = LOSS_RE.search(line)
+        if m:
+            item["loss"] = try_float(m.group(1))
+    if "throughput" not in item:
+        m = THROUGHPUT_RE.search(line)
+        if m:
+            item["throughput"] = try_float(m.group(1))
+    if "s_per_iter" not in item:
+        m = SITER_RE.search(line)
+        if m:
+            item["s_per_iter"] = try_float(m.group(1))
 
     return item if item else None
 
