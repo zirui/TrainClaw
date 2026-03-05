@@ -1,0 +1,11 @@
+name: slurm-mock
+workdir: .
+env_check:
+  enabled: false
+slurm:
+  out_path_template: /tmp/omniflow.%j.out
+  follow: false
+command:
+  - bash
+  - -lc
+  - echo Submitted batch job 12345
