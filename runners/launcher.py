@@ -184,6 +184,17 @@ def query_gpu_snapshot(gpu_backend):
     return []
 
 
+def is_useful_gpu_record(rec):
+    metric_keys = [
+        "utilization_gpu_pct",
+        "memory_used_mb",
+        "memory_total_mb",
+        "memory_used_pct",
+        "temperature_c",
+    ]
+    return any(rec.get(k) is not None for k in metric_keys)
+
+
 def normalize_key(raw_key):
     key = raw_key.strip().lower()
     key = key.replace("/", "_per_").replace(".", "_").replace("-", "_")
@@ -342,6 +353,8 @@ def gpu_sampler(stop_event, interval_sec, metrics_fh, gpu_backend):
     while not stop_event.is_set():
         ts = now_ts()
         for rec in query_gpu_snapshot(gpu_backend):
+            if not is_useful_gpu_record(rec):
+                continue
             metrics_fh.write(json.dumps({"ts": ts, "type": "gpu", **rec}, ensure_ascii=True) + "\n")
         metrics_fh.flush()
         stop_event.wait(interval_sec)
