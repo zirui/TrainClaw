@@ -8,7 +8,6 @@ import shutil
 import statistics
 import subprocess
 import sys
-import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -349,17 +348,6 @@ def parse_train_line(line):
     return item
 
 
-def gpu_sampler(stop_event, interval_sec, metrics_fh, gpu_backend):
-    while not stop_event.is_set():
-        ts = now_ts()
-        for rec in query_gpu_snapshot(gpu_backend):
-            if not is_useful_gpu_record(rec):
-                continue
-            metrics_fh.write(json.dumps({"ts": ts, "type": "gpu", **rec}, ensure_ascii=True) + "\n")
-        metrics_fh.flush()
-        stop_event.wait(interval_sec)
-
-
 def summarize(train_records, gpu_records, warmup_steps):
     tputs = []
     siters = []
@@ -497,12 +485,6 @@ def stream_external_log(
                 else:
                     idle_rounds += 1
 
-        ts = now_ts()
-        for rec in query_gpu_snapshot(gpu_backend):
-            metrics_fh.write(json.dumps({"ts": ts, "type": "gpu", **rec}, ensure_ascii=True) + "\n")
-            gpu_records.append(rec)
-        metrics_fh.flush()
-
         time.sleep(interval_sec)
 
         _, active = slurm_job_state(job_id)
@@ -576,17 +558,6 @@ def main():
     with open(log_path, "w", encoding="utf-8") as log_fh, open(
         metrics_path, "w", encoding="utf-8"
     ) as metrics_fh:
-        stop_event = threading.Event()
-        sampler_enabled = slurm_cfg.get("follow", False) is False
-        t = None
-        if sampler_enabled:
-            t = threading.Thread(
-                target=gpu_sampler,
-                args=(stop_event, interval_sec, metrics_fh, gpu_backend),
-                daemon=True,
-            )
-            t.start()
-
         proc = subprocess.Popen(
             cmd_list,
             cwd=workdir,
@@ -614,17 +585,7 @@ def main():
             metrics_fh.flush()
             log_fh.flush()
 
-            if sampler_enabled:
-                ts = now_ts()
-                for rec in query_gpu_snapshot(gpu_backend):
-                    metrics_fh.write(json.dumps({"ts": ts, "type": "gpu", **rec}, ensure_ascii=True) + "\n")
-                    gpu_records.append(rec)
-
         exit_code = proc.wait()
-
-        if t is not None:
-            stop_event.set()
-            t.join(timeout=2)
 
         submit_stdout = "\n".join(submit_stdout_lines)
         m = SBATCH_JOB_RE.search(submit_stdout)
@@ -662,10 +623,6 @@ def main():
                 )
                 slurm_state, _ = slurm_job_state(slurm_job_id)
 
-        ts = now_ts()
-        for rec in query_gpu_snapshot(gpu_backend):
-            metrics_fh.write(json.dumps({"ts": ts, "type": "gpu", **rec}, ensure_ascii=True) + "\n")
-            gpu_records.append(rec)
         metrics_fh.flush()
 
     duration = time.time() - start
