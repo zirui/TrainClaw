@@ -1,7 +1,7 @@
 name: omniflow-slurm
 workdir: /Users/zirui/code/OmniFlow-amd
 metrics_interval_sec: 5
-warmup_steps: 50
+warmup_steps: 2
 gpu:
   backend: auto
 env_check:
